@@ -31,6 +31,8 @@ from webserver.toolbox.base_tool import BaseTool
 from .pdf_engine import (
     ALLOWED_BLUR,
     ALLOWED_DILATE,
+    GAMMA_MAX,
+    GAMMA_MIN,
     MAX_WIDTH_MAX,
     MAX_WIDTH_MIN,
     QUALITY_MAX,
@@ -38,12 +40,16 @@ from .pdf_engine import (
     ImageProcessOptions,
     is_bilevel_page,
     jpeg2000_available,
+    page_native_width,
     render_page,
     save_pdf,
 )
 
 MAX_SEARCH_RESULTS = 50
 WORK_RETENTION_SECONDS = 7 * 24 * 60 * 60
+CLEANUP_INTERVAL_SECONDS = 10 * 60
+PREVIEW_WIDTH_MIN = 320
+PREVIEW_WIDTH_MAX = 4096
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _QUERY_KEYS = (
     "mode",
@@ -56,6 +62,7 @@ _QUERY_KEYS = (
     "blur",
     "closing",
     "dct_denoise",
+    "gamma",
     "skip_pages",
     "drop_pages",
 )
@@ -228,7 +235,7 @@ def _parse_page_selection(page_spec: str, total_pages: int, option_name: str) ->
 @dataclass(frozen=True)
 class ToolParams:
     mode: str = "gray"
-    max_width: int = 1024
+    max_width: Optional[int] = None
     quality: int = 85
     lossless: bool = False
     auto_correct: bool = True
@@ -237,6 +244,7 @@ class ToolParams:
     blur: float = 0.0
     closing: bool = False
     dct_denoise: int = 0
+    gamma: float = 1.0
     skip_pages: str = ""
     drop_pages: str = ""
 
@@ -252,6 +260,7 @@ class ToolParams:
             blur=self.blur if not skip_filters else 0.0,
             closing=self.closing and not skip_filters,
             dct_denoise=self.dct_denoise,
+            gamma=self.gamma if not skip_filters else 1.0,
         )
 
 
@@ -262,8 +271,8 @@ def parse_params(raw: Optional[dict]) -> ToolParams:
     if mode not in ("color", "gray", "bw"):
         raise ValueError(_("色彩模式不合法"))
 
-    max_width = _int_value(raw.get("max_width"), _("最大宽度"), 1024)
-    if not MAX_WIDTH_MIN <= max_width <= MAX_WIDTH_MAX:
+    max_width = _int_value(raw.get("max_width"), _("最大宽度"))
+    if max_width is not None and not MAX_WIDTH_MIN <= max_width <= MAX_WIDTH_MAX:
         raise ValueError(_("最大宽度必须在 %d-%d 之间") % (MAX_WIDTH_MIN, MAX_WIDTH_MAX))
 
     quality = _int_value(raw.get("quality"), _("压缩质量"), 85)
@@ -288,6 +297,12 @@ def parse_params(raw: Optional[dict]) -> ToolParams:
     if not 0 <= dct_denoise <= 3:
         raise ValueError(_("DCT 去噪强度必须在 0-3 之间"))
 
+    gamma = round(_float_value(raw.get("gamma"), _("Gamma 值"), 1.0), 3)
+    if not GAMMA_MIN <= gamma <= GAMMA_MAX:
+        raise ValueError(
+            _("Gamma 值必须在 %s-%s 之间") % (GAMMA_MIN, GAMMA_MAX)
+        )
+
     return ToolParams(
         mode=mode,
         max_width=max_width,
@@ -299,6 +314,7 @@ def parse_params(raw: Optional[dict]) -> ToolParams:
         blur=blur,
         closing=_bool_value(raw.get("closing")),
         dct_denoise=dct_denoise,
+        gamma=gamma,
         skip_pages=_text_value(raw.get("skip_pages")),
         drop_pages=_text_value(raw.get("drop_pages")),
     )
@@ -320,7 +336,7 @@ class MinifyPdfPro(BaseTool):
     _MAX_JOBS = 20
 
     _cleanup_lock = threading.Lock()
-    _cleanup_done = False
+    _last_cleanup = 0.0
 
     @staticmethod
     def info():
@@ -376,13 +392,26 @@ class MinifyPdfPro(BaseTool):
             return dict(job) if job else None
 
     def _cleanup_old_work_dirs(self) -> None:
+        """清理工具产生的临时文件。
+
+        每次执行工具操作时都会调用，但最多每 ``CLEANUP_INTERVAL_SECONDS`` 秒真正扫描
+        一次，避免高频请求反复遍历目录。清理内容：
+
+        - ``uploads`` 下超过保留期的上传文件；
+        - 不属于内存中任务的 ``job-*`` 目录（进程重启后这些任务已无法下载，直接删除）；
+        - 内存中任务对应、但超过保留期的 ``job-*`` 目录。
+        """
+        now = time.time()
+        cls = type(self)
         with self._cleanup_lock:
-            if self._cleanup_done:
+            if now - cls._last_cleanup < CLEANUP_INTERVAL_SECONDS:
                 return
-            self._cleanup_done = True
+            # 记录在类上：每次请求都会新建工具实例，节流状态必须跨实例共享。
+            cls._last_cleanup = now
         try:
             root = self.work_root()
-            now = time.time()
+            with self._jobs_lock:
+                known_jobs = set(self._jobs)
             for name in os.listdir(root):
                 path = os.path.join(root, name)
                 try:
@@ -390,6 +419,11 @@ class MinifyPdfPro(BaseTool):
                         self._cleanup_uploads(path, now)
                         continue
                     if not name.startswith("job-") or not os.path.isdir(path):
+                        continue
+                    if name[len("job-"):] not in known_jobs:
+                        # 内存里已没有这条任务，结果文件再也无法下载。
+                        shutil.rmtree(path, ignore_errors=True)
+                        logging.info("[minify_pdf_pro] 已清理无主任务目录：%s", path)
                         continue
                     if now - os.path.getmtime(path) <= WORK_RETENTION_SECONDS:
                         continue
@@ -399,6 +433,11 @@ class MinifyPdfPro(BaseTool):
                 logging.info("[minify_pdf_pro] 已清理过期目录：%s", path)
         except Exception as err:  # noqa: BLE001
             logging.warning("[minify_pdf_pro] 清理临时目录失败：%s", err)
+
+    def _remove_job_dir(self, job_id: str) -> None:
+        """删除某个任务的临时目录（仅用于不可能再提供下载的任务）。"""
+        path = os.path.join(self.work_root(), "job-" + job_id)
+        shutil.rmtree(path, ignore_errors=True)
 
     @staticmethod
     def _cleanup_uploads(directory: str, now: float) -> None:
@@ -511,7 +550,8 @@ class MinifyPdfPro(BaseTool):
 
     @AsyncService.register_function
     def render_page_image(self, source: dict, page_number: int, params: ToolParams,
-                          processed: bool = True) -> bytes:
+                          processed: bool = True,
+                          render_width: Optional[int] = None) -> bytes:
         path = self._resolve_source(source)
         doc = fitz.open(path)
         try:
@@ -527,7 +567,18 @@ class MinifyPdfPro(BaseTool):
                 options = params.image_options(page, index in skip)
             else:
                 options = ImageProcessOptions()
-            img = render_page(page, options, params.max_width)
+            width = params.max_width
+            native_width = page_native_width(page)
+            if width is None:
+                # 未限定页宽：预览按原生宽度，其次才回落到设备像素。
+                width = native_width or render_width
+            else:
+                if render_width:
+                    # 预览按显示端设备像素渲染，但不得低于输出宽度。
+                    width = max(width, render_width)
+                if native_width:
+                    width = min(width, native_width)
+            img = render_page(page, options, width)
             buffer = io.BytesIO()
             img.save(buffer, format="PNG", optimize=True)
             return buffer.getvalue()
@@ -665,6 +716,7 @@ class MinifyPdfPro(BaseTool):
                     "new_size": new_size,
                     "stage": "done",
                 })
+                self._remove_job_dir(job_id)
                 return
 
             saved = old_size - new_size
@@ -687,12 +739,16 @@ class MinifyPdfPro(BaseTool):
                 stats.update({"download_ready": True, "stage": "done"})
 
             self._finish(job_id, task_id, "completed", stats)
+            if mode == "replace":
+                # 已写回书库，任务不会再提供下载，目录无需保留。
+                self._remove_job_dir(job_id)
             logging.info(
                 "[minify_pdf_pro] job=%s 完成：%s -> %s", job_id, old_size, new_size
             )
         except Exception as err:  # noqa: BLE001
             logging.error("[minify_pdf_pro] 处理失败 job=%s: %s", job_id, err)
             self._remove(output_path)
+            self._remove_job_dir(job_id)
             self._update_job(
                 job_id, status="failed", stage="failed", progress=100, error=str(err)
             )
@@ -750,6 +806,7 @@ class MinifyPdfPro(BaseTool):
             logging.warning("[minify_pdf_pro] 删除临时文件失败 %s: %s", path, err)
 
     def download_file(self, job_id: str) -> tuple:
+        self._cleanup_old_work_dirs()
         job = self._get_job(job_id)
         if not job:
             raise RuntimeError(_("任务不存在或已过期"))
@@ -839,6 +896,13 @@ class RenderHandler(BaseHandler):
         try:
             page_number = int(self.get_argument("page", "1"))
             params = parse_params(_request_params(self))
+            render_width = _int_value(self.get_argument("render_width", ""), _("预览宽度"))
+            if render_width is not None and not (
+                PREVIEW_WIDTH_MIN <= render_width <= PREVIEW_WIDTH_MAX
+            ):
+                raise ValueError(
+                    _("预览宽度必须在 %d-%d 之间") % (PREVIEW_WIDTH_MIN, PREVIEW_WIDTH_MAX)
+                )
             book_id = self.get_argument("book_id", "")
             upload_id = self.get_argument("upload_id", "")
             if book_id:
@@ -852,6 +916,7 @@ class RenderHandler(BaseHandler):
                 page_number,
                 params,
                 _bool_value(self.get_argument("processed", "0")),
+                render_width,
             )
         except ValueError as err:
             self.set_status(400)

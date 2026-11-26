@@ -34,6 +34,8 @@ QUALITY_MIN = 60
 QUALITY_MAX = 100
 ALLOWED_DILATE = (0.0, 0.25, 0.5, 1.0)
 ALLOWED_BLUR = (0.0, 1.0, 2.0)
+GAMMA_MIN = 0.4
+GAMMA_MAX = 2.5
 
 
 def otsu_threshold(gray_img: Image.Image) -> int:
@@ -67,9 +69,15 @@ def otsu_threshold(gray_img: Image.Image) -> int:
     return threshold
 
 
-def _to_binary(img: Image.Image) -> Image.Image:
+def _to_binary(img: Image.Image, bilevel_source: bool = False) -> Image.Image:
     gray = img.convert("L")
-    threshold = otsu_threshold(gray)
+    if bilevel_source:
+        # 源图本就是两级色（1-bit，常见为 Indexed 调色板），按墨色与纸色的中点切分
+        # 才能还原原始点阵；Otsu 在整页大面积留白时会被纸色拉高阈值，把字明显加粗。
+        low, high = gray.getextrema()
+        threshold = (low + high) // 2 if high - low >= 16 else otsu_threshold(gray)
+    else:
+        threshold = otsu_threshold(gray)
     return gray.point(lambda x: 255 if x > threshold else 0, mode="1")
 
 
@@ -81,6 +89,20 @@ def _apply_dct_denoise(img: Image.Image, strength: int) -> Image.Image:
 
 def _auto_correct_by_histogram(img: Image.Image) -> Image.Image:
     return ImageOps.autocontrast(img, cutoff=1)
+
+
+def _apply_gamma(img: Image.Image, gamma: float) -> Image.Image:
+    """按 gamma 曲线调整中间调：gamma > 1 提亮，gamma < 1 压暗，1 为原样。"""
+    if gamma <= 0 or math.isclose(gamma, 1.0, rel_tol=0, abs_tol=1e-6):
+        return img
+    if img.mode not in ("RGB", "L"):
+        return img
+    inverse = 1.0 / gamma
+    lut = [
+        min(255, max(0, round(255 * ((value / 255.0) ** inverse))))
+        for value in range(256)
+    ]
+    return img.point(lut * len(img.getbands()))
 
 
 def _cleanup_gray_background(img: Image.Image, max_brightness: int) -> Image.Image:
@@ -148,6 +170,7 @@ class ImageProcessOptions:
     closing: bool = False
     dct_denoise: int = 0
     max_width: Optional[int] = None
+    gamma: float = 1.0
 
     def __post_init__(self) -> None:
         if self.to_bw and self.to_gray:
@@ -156,6 +179,8 @@ class ImageProcessOptions:
             raise ValueError("背景亮度阈值仅用于灰度模式")
         if self.max_brightness is not None and not 0 <= self.max_brightness <= 255:
             raise ValueError("背景亮度阈值必须在 0-255 之间")
+        if not GAMMA_MIN <= self.gamma <= GAMMA_MAX:
+            raise ValueError("gamma 必须在 %s-%s 之间" % (GAMMA_MIN, GAMMA_MAX))
         if self.blur < 0:
             raise ValueError("blur 不能小于 0")
         if self.dilate < 0:
@@ -171,7 +196,8 @@ class PdfImageProcessor:
     def __init__(self, options: Optional[ImageProcessOptions] = None) -> None:
         self.options = options or ImageProcessOptions()
 
-    def process(self, img: Image.Image, has_dct_image: bool = False) -> Image.Image:
+    def process(self, img: Image.Image, has_dct_image: bool = False,
+                bilevel_source: bool = False) -> Image.Image:
         options = self.options
         if options.max_width is not None:
             img = _scale_to_width(img, options.max_width)
@@ -182,6 +208,8 @@ class PdfImageProcessor:
             img = _apply_dct_denoise(img, options.dct_denoise)
         if options.auto_correct:
             img = _auto_correct_by_histogram(img)
+        if options.gamma != 1.0:
+            img = _apply_gamma(img, options.gamma)
         if options.closing:
             img = _apply_closing(img)
         if options.dilate > 0:
@@ -190,7 +218,7 @@ class PdfImageProcessor:
             img = img.filter(ImageFilter.GaussianBlur(radius=options.blur))
 
         if options.to_bw:
-            return _to_binary(img)
+            return _to_binary(img, bilevel_source)
         if options.to_gray:
             img = img.convert("L")
             if options.max_brightness is not None:
@@ -208,10 +236,11 @@ def page_has_dct_image(page: fitz.Page) -> bool:
     return any("DCTDecode" in (image[8] or "") for image in page.get_images(full=True))
 
 
-def page_render_dpi(page: fitz.Page) -> float:
+def _single_full_page_image(page: fitz.Page) -> Optional[dict]:
+    """整页只铺一张图时返回该图信息，否则返回 None。"""
     images = page.get_image_info()
     if len(images) != 1:
-        return DEFAULT_RENDER_DPI
+        return None
 
     image = images[0]
     bbox = fitz.Rect(image["bbox"])
@@ -222,12 +251,31 @@ def page_render_dpi(page: fitz.Page) -> float:
         or bbox.x1 < page_rect.x1 - page_rect.width * 0.05
         or bbox.y1 < page_rect.y1 - page_rect.height * 0.05
     ):
-        return DEFAULT_RENDER_DPI
+        return None
+    return image
 
+
+def page_native_dpi(page: fitz.Page) -> Optional[float]:
+    """整页单图时返回该图的原生 DPI，其他页面返回 None。"""
+    image = _single_full_page_image(page)
+    if image is None:
+        return None
+
+    bbox = fitz.Rect(image["bbox"])
+    if bbox.width <= 0 or bbox.height <= 0:
+        return None
     image_dpi = min(
         image["width"] * 72 / bbox.width, image["height"] * 72 / bbox.height
     )
-    return min(DEFAULT_RENDER_DPI, image_dpi) if image_dpi > 0 else DEFAULT_RENDER_DPI
+    return image_dpi if image_dpi > 0 else None
+
+
+def page_native_width(page: fitz.Page) -> Optional[int]:
+    """整页单图时返回该图原生分辨率对应的页面像素宽度（避免预览放大超采样）。"""
+    image_dpi = page_native_dpi(page)
+    if image_dpi is None:
+        return None
+    return max(1, round(page.rect.width * image_dpi / 72))
 
 
 def render_page(
@@ -239,7 +287,8 @@ def render_page(
     if max_width and src_width > 0:
         scale = max_width / src_width
     else:
-        scale = page_render_dpi(page) / 72.0
+        # 未限定页宽：扫描页按嵌入图原生分辨率渲染，不额外缩放。
+        scale = (page_native_dpi(page) or DEFAULT_RENDER_DPI) / 72.0
     scale = max(scale, 0.01)
 
     matrix = fitz.Matrix(scale, scale)
@@ -248,7 +297,9 @@ def render_page(
     img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
 
     return PdfImageProcessor(options).process(
-        img, has_dct_image=page_has_dct_image(page)
+        img,
+        has_dct_image=page_has_dct_image(page),
+        bilevel_source=is_bilevel_page(page),
     )
 
 
