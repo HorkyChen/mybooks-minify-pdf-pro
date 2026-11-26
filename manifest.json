@@ -1,0 +1,24 @@
+{
+  "tool_id": "minify_pdf_pro",
+  "name": "PDF瘦身(PRO)",
+  "description": "从书库选书或上传 PDF，逐页预览处理效果，支持灰度/黑白、缩放、模糊、加粗、无损编码等参数；可将更小的结果直接写回书库。",
+  "revision": "0.1.0",
+  "author": "Horky",
+  "publish_date": "2026-11-26",
+  "core_api_version": "1.5.0",
+  "entry_backend": "tool.MinifyPdfPro",
+  "entry_frontend": "index.html",
+  "page": "minify_pdf_pro",
+  "repo_url": "https://github.com/HorkyChen/mybooks-minify-pdf-pro",
+  "locales": ["zh"],
+  "default_locale": "zh",
+  "api_routes": [
+    { "path": "search", "handler": "tool.SearchHandler" },
+    { "path": "info", "handler": "tool.InfoHandler" },
+    { "path": "upload", "handler": "tool.UploadHandler" },
+    { "path": "render", "handler": "tool.RenderHandler" },
+    { "path": "start", "handler": "tool.StartHandler" },
+    { "path": "status", "handler": "tool.StatusHandler" },
+    { "path": "download", "handler": "tool.DownloadHandler" }
+  ]
+}
